@@ -1,8 +1,8 @@
 This is a fork of https://github.com/balloob/pychromecast.
 It is a POC of a working YouTube controller that uses the Youtube Queue.
-**This is still work in progress**
+**This is still work in progress and very buggy!**
 
-How to use
+Basic use
 ----------
 
 .. code:: python
