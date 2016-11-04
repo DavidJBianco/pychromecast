@@ -19,12 +19,12 @@ VIDEO_ID_PARAM = '%7B%22videoId%22%3A%22{video_id}%22%2C%22currentTime%22%3A5%2C
 TERMINATE_PARAM = "terminate"
 
 REQUEST_URL_SET_PLAYLIST = YOUTUBE_BASE_URL + "api/lounge/bc/bind?"
-REQUEST_PARAMS_SET_PLAYLIST = {"device": "REMOTE_CONTROL", "id": RANDOM_ID, "name": "Desktop&app=youtube-desktop",
-                               "mdx-version": 3, "loungeIdToken": None, "SID": None, "VER": 8, "v": 2, "ui": 1,
-                               "method": "setPlaylist",
-                               "params": "%7B%22videoId%22%3A%22{video_id}%22%2C%22"
-                                         "currentTime%22%3A5%2C%22currentIndex%22%3A0%7D",
-                               "RID": 75956, "TYPE": None, "CVER": 1, "gsessionid": None, "t": 1}
+BASE_REQUEST_PARAMS = {"device": "REMOTE_CONTROL", "id": RANDOM_ID, "name": "Desktop&app=youtube-desktop",
+                       "mdx-version": 3, "loungeIdToken": None, "VER": 8, "v": 2, "t": 1, "ui": 1, "RID": 75956,
+                       "CVER": 1}
+
+SET_PLAYLIST_METHOD = {"method": "setPlaylist", "params": VIDEO_ID_PARAM, "TYPE": None}
+REQUEST_PARAMS_SET_PLAYLIST = {**BASE_REQUEST_PARAMS, **SET_PLAYLIST_METHOD}
 
 REQUEST_DATA_SET_PLAYLIST = "count=0"
 REQUEST_DATA_ADD_TO_PLAYLIST = "count=1&ofs=%d&req0__sc=addVideo&req0_videoId=%s"
@@ -36,9 +36,10 @@ REQUEST_DATA_LOUNGE_TOKEN = "screen_ids={screenId}&session_token={XSRFToken}"
 
 YOUTUBE_SESSION_TOKEN_REGEX = 'XSRF_TOKEN\W*(.*)="'
 SID_REGEX = '"c","(.*?)",\"'
-PLAYLIST_ID_REGEX = 'listId":(.*?)","'
-FIRST_VIDEO_ID_REGEX = 'firstVideoId":"(.*?)","'
+PLAYLIST_ID_REGEX = 'listId":"(.*?)"'
+FIRST_VIDEO_ID_REGEX = 'firstVideoId":"(.*?)"'
 GSESSION_ID_REGEX = '"S","(.*?)"]'
+NOW_PLAYING_REGEX = 'videoId":"(.*?)"'
 
 EXPIRED_LOUNGE_ID_RESPONSE_CONTENT = "Expired lounge id token"
 
@@ -77,15 +78,13 @@ class YouTubeController(BaseController):
         self.screen_id = None
         self.video_id = None
         self.playlist = None
+        self._now_playing = None
         self.status_update_event = threading.Event()
 
     @property
     def video_url(self):
         """Returns the base watch video url with the current video_id"""
-        video = self.video_id
-        if self.status:
-            if self.status.content_id:
-                video = self.status.content_id
+        video = self._now_playing or self.video_id
         return YOUTUBE_WATCH_VIDEO_URL + video
 
     @property
@@ -156,7 +155,7 @@ class YouTubeController(BaseController):
         Sets the lounge token.
         """
         if not self.screen_id:
-            raise ValueError("screen id is None. update_screen_id must be called.")
+            raise ValueError("Screen id is None. update_screen_id must be called.")
         if not self._xsrf_token:
             raise ValueError("xsrf token is None. Get xsrf token must be called.")
         data = REQUEST_DATA_LOUNGE_TOKEN.format(screenId=self.screen_id, XSRFToken=self._xsrf_token)
@@ -172,7 +171,7 @@ class YouTubeController(BaseController):
             raise YoutubeSessionError("Could not get lounge id. XSRF token has expired or not valid.")
         self._lounge_token = lounge_token
 
-    def _start_session(self):
+    def _set_playlist(self):
         """
         Sends a POST to start the session.
         Uses loung_token and video id as parameters.
@@ -190,16 +189,46 @@ class YouTubeController(BaseController):
         if response.status_code == 401 and content.find(EXPIRED_LOUNGE_ID_RESPONSE_CONTENT) != -1:
             raise YoutubeSessionError("The lounge token expired.")
         response.raise_for_status()
+        if not self.in_session:
+            self._extract_session_parameters(content)
+
+    def _update_session_parameters(self):
+        """
+        Sends a POST with no playlist parameters.
+        Gets the playlist id, SID, gsession id.
+        First video(the playlist base video) and now playing are also returned if  playlist is initialized.
+        """
+        url_params = BASE_REQUEST_PARAMS.copy()
+        url_params['loungeIdToken'] = self._lounge_token
+        response = self._do_post(REQUEST_URL_SET_PLAYLIST, data='', params=url_params)
+        self._extract_session_parameters(str(response.content))
+        return response
+
+    def _extract_session_parameters(self, response_packet_content):
+        """
+        Extracts the playlist id, SID, gsession id, first video(the playlist base video)
+        and now playing from a session response.
+        :param response_packet_content: (str) the response packet content
+        """
+        content = response_packet_content
+        playlist_id = re.search(PLAYLIST_ID_REGEX, content)
         sid = re.search(SID_REGEX, content)
         gsession = re.search(GSESSION_ID_REGEX, content)
-        playlist_id = re.search(PLAYLIST_ID_REGEX, content)
         first_video = re.search(FIRST_VIDEO_ID_REGEX, content)
-        if not(sid and gsession and playlist_id and first_video):
+        now_playing = re.search(NOW_PLAYING_REGEX, content)
+        if not (sid and gsession and playlist_id):
             raise YoutubeSessionError("Could not parse session parameters.")
         self._sid = sid.group(1)
         self._gsession_id = gsession.group(1)
         self._playlist_id = playlist_id.group(1)
-        self._first_video = first_video.group(1)
+        if first_video:
+            self._first_video = first_video.group(1)
+        else:
+            self._first_video = None
+        if now_playing:
+            self._now_playing = now_playing.group(1)
+        else:
+            self._now_playing = None
 
     def _manage_playlist(self, data, referer=None, **kwargs):
         """
@@ -215,10 +244,13 @@ class YouTubeController(BaseController):
             raise ValueError("sid must be initialized to manage playlist")
         if not self.video_id:
             raise ValueError("video_id can't be empty")
+        if self.in_session:
+            self._update_session_parameters()
+        param_video_id = self._first_video or self.video_id
 
         url_params = REQUEST_PARAMS_SET_PLAYLIST.copy()
         url_params["loungeIdToken"] = self._lounge_token
-        url_params["params"] = VIDEO_ID_PARAM.format(video_id=self._first_video)
+        url_params["params"] = VIDEO_ID_PARAM.format(video_id=param_video_id)
         url_params["gsessionid"] = self._gsession_id
         url_params["SID"] = self._sid
         for key in kwargs:
@@ -228,7 +260,7 @@ class YouTubeController(BaseController):
             self._do_post(REQUEST_URL_SET_PLAYLIST, referer=referer, data=data, params=url_params)
         except requests.HTTPError:
             # Try to re-get session variables and post again.
-            self._start_session()
+            self._set_playlist()
             url_params["loungeIdToken"] = self._lounge_token
             url_params["params"] = VIDEO_ID_PARAM.format(video_id=self._first_video)
             url_params["gsessionid"] = self._gsession_id
@@ -266,6 +298,7 @@ class YouTubeController(BaseController):
         self._sid = None
         self._ofs = 0
         self.playlist = None
+        self._first_video = None
 
     def receive_message(self, message, data):
         """ Called when a media message is received. """
@@ -277,25 +310,25 @@ class YouTubeController(BaseController):
         else:
             return False
 
+    def start_new_session(self, youtube_id):
+        self.video_id = youtube_id
+        self.update_screen_id()
+        self._get_xsrf_token()
+        self._get_lounge_id()
+        self._update_session_parameters()
+
     def play_video(self, youtube_id):
         """
         Starts playing a video in the YouTube app.
         The youtube id is also a session identifier used in all requests for the session.
         :param youtube_id: The video id to play.
         """
-        if self.in_session:
-            self.terminate_session()
-        self.video_id = youtube_id
-        self.launch()
-        self.update_screen_id()
-        self._get_xsrf_token()
-        self._get_lounge_id()
-        self._start_session()
-        # if a session was already active we joined it but didn't play the video.
-        if self._first_video == youtube_id:
-            return True
-        else:
-            return False
+        if not self.in_session:
+            self.start_new_session(youtube_id)
+        if self._first_video:
+            self.clear_playlist()
+        self._set_playlist()
+        self._update_session_parameters()
 
     def add_to_queue(self, youtube_id):
         """
@@ -307,16 +340,15 @@ class YouTubeController(BaseController):
             raise YoutubeSessionError('Session must be initialized to add to queue')
         if not self.playlist:
             self.playlist = [self.video_id]
-        if youtube_id in self.playlist:
+        elif youtube_id in self.playlist:
             raise YoutubeControllerError("Video already in queue")
         self.update_screen_id()
-        if self.status.player_is_idle:
-            raise YoutubeControllerError("Can't add to queue while video is idle")
+        # if self.status.player_is_idle:
+        #     raise YoutubeControllerError("Can't add to queue while video is idle")
         if self.status.player_state == "BUFFERING":
             raise YoutubeControllerError("Can't add to queue while video is buffering")
         self._ofs += 1
-        self._manage_playlist(referer=YOUTUBE_WATCH_VIDEO_URL + self.status.content_id,
-                              data=REQUEST_DATA_ADD_TO_PLAYLIST % (self._ofs, youtube_id))
+        self._manage_playlist(data=REQUEST_DATA_ADD_TO_PLAYLIST % (self._ofs, youtube_id))
         self.playlist.append(youtube_id)
 
     def _send_command(self, message, namespace=MEDIA_NAMESPACE):
